@@ -10,6 +10,7 @@ from typing import Any, Optional, Union
 
 from adafruit_hid.consumer_control import ConsumerControl
 from adafruit_hid.keyboard import Keyboard
+from adafruit_hid.keyboard_layout_us import KeyboardLayoutUS
 from adafruit_hid.mouse import Mouse
 from evdev import InputDevice, InputEvent, KeyEvent, RelEvent, categorize, list_devices
 import pyudev
@@ -45,6 +46,7 @@ class GadgetManager:
             "keyboard": None,
             "mouse": None,
             "consumer": None,
+            "keyboard_layout": None,
         }
         self._enabled = False
 
@@ -61,7 +63,9 @@ class GadgetManager:
         usb_hid.enable([Device.BOOT_MOUSE, Device.KEYBOARD, Device.CONSUMER_CONTROL])  # type: ignore
         enabled_devices = list(usb_hid.devices)  # type: ignore
 
-        self._gadgets["keyboard"] = Keyboard(enabled_devices)
+        keyboard = Keyboard(enabled_devices)
+        self._gadgets["keyboard"] = keyboard
+        self._gadgets["keyboard_layout"] = KeyboardLayoutUS(keyboard)
         self._gadgets["mouse"] = Mouse(enabled_devices)
         self._gadgets["consumer"] = ConsumerControl(enabled_devices)
         self._enabled = True
@@ -94,6 +98,15 @@ class GadgetManager:
         :rtype: ConsumerControl | None
         """
         return self._gadgets["consumer"]
+
+    def get_keyboard_layout(self) -> Optional[KeyboardLayoutUS]:
+        """
+        Get the KeyboardLayout gadget for typing text.
+
+        :return: A KeyboardLayoutUS object, or None if not initialized
+        :rtype: KeyboardLayoutUS | None
+        """
+        return self._gadgets["keyboard_layout"]
 
 
 class ShortcutToggler:
@@ -340,8 +353,17 @@ class DeviceRelay:
 
         # Ctrl tap sequence detection for mouse movement patterns
         self._ctrl_tap_times: list[float] = []
+        self._ctrl_tap_lock = asyncio.Lock()  # Prevent race conditions in tap detection
         self._mouse_movement_task: Optional[asyncio.Task] = None
         self._mouse_movement_active = False
+
+        # Shift+Ctrl combo tap sequence detection for poem output
+        self._shift_ctrl_tap_times: list[float] = []
+        self._shift_ctrl_tap_lock = asyncio.Lock()  # Prevent race conditions in tap detection
+        self._shift_pressed = False  # Track if Shift is currently held
+        self._ctrl_pressed = False   # Track if Ctrl is currently held
+        self._poem_output_task: Optional[asyncio.Task] = None
+        self._poem_output_active = False
 
         # Load mouse movement configuration
         self._movement_config = self._load_movement_config()
@@ -423,6 +445,8 @@ class DeviceRelay:
             # Check for Ctrl tap sequence (run without blocking)
             if isinstance(event, KeyEvent):
                 asyncio.create_task(self._check_ctrl_tap_sequence(event))
+                # Check for Shift+Ctrl combo tap sequence (run without blocking)
+                asyncio.create_task(self._check_shift_ctrl_tap_sequence(event))
 
             if self._shortcut_toggler and isinstance(event, KeyEvent):
                 self._shortcut_toggler.handle_key_event(event)
@@ -513,34 +537,37 @@ class DeviceRelay:
         if event.keystate != KeyEvent.key_down:
             return
 
-        current_time = time.time()
-        tap_window = 3.0  # seconds
-        required_taps = 5
+        # Use lock to prevent race conditions when multiple Ctrl taps arrive rapidly
+        async with self._ctrl_tap_lock:
+            current_time = time.time()
+            tap_window = 3.0  # seconds
+            required_taps = 5
 
-        # Add current tap time
-        self._ctrl_tap_times.append(current_time)
+            # Add current tap time
+            self._ctrl_tap_times.append(current_time)
 
-        # Remove taps older than the window
-        self._ctrl_tap_times = [
-            t for t in self._ctrl_tap_times if current_time - t <= tap_window
-        ]
+            # Remove taps older than the window
+            self._ctrl_tap_times = [
+                t for t in self._ctrl_tap_times if current_time - t <= tap_window
+            ]
 
-        tap_count = len(self._ctrl_tap_times)
-        _logger.debug(
-            f"Ctrl tap detected! Count: {tap_count}/{required_taps} in last {tap_window}s"
-        )
-
-        # Check if we have enough taps
-        if tap_count >= required_taps:
-            _logger.warning(
-                f"🎯 Ctrl tap sequence detected! {tap_count} taps in {tap_window} seconds"
+            tap_count = len(self._ctrl_tap_times)
+            _logger.debug(
+                f"Ctrl tap detected! Count: {tap_count}/{required_taps} in last {tap_window}s"
             )
-            await self._toggle_mouse_movement()
-            # Clear the tap times after triggering
-            self._ctrl_tap_times.clear()
+
+            # Check if we have enough taps
+            if tap_count >= required_taps:
+                _logger.warning(
+                    f"🎯 Ctrl tap sequence detected! {tap_count} taps in {tap_window} seconds"
+                )
+                await self._toggle_mouse_movement()
 
     async def _toggle_mouse_movement(self) -> None:
         """Toggle the mouse movement on/off"""
+        # Clear tap times at the start to prevent them from interfering with next detection
+        self._ctrl_tap_times.clear()
+
         if self._mouse_movement_active:
             # Stop the mouse movement
             _logger.warning(
@@ -576,6 +603,190 @@ class DeviceRelay:
             self._mouse_movement_active = True
             self._mouse_movement_task = asyncio.create_task(self._mouse_movement_loop())
             _logger.warning(f"🖱️  {self._current_pattern.capitalize()} mouse movement started")
+
+    def _is_shift_key(self, event: KeyEvent) -> bool:
+        """Check if the event is a Shift key press"""
+        return event.scancode in (ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT)
+
+    async def _check_shift_ctrl_tap_sequence(self, event: KeyEvent) -> None:
+        """Detect 5 Shift+Ctrl combo taps within 3 seconds to toggle poem output"""
+        # Track Shift and Ctrl key states
+        if self._is_shift_key(event):
+            if event.keystate == KeyEvent.key_down:
+                self._shift_pressed = True
+            elif event.keystate == KeyEvent.key_up:
+                self._shift_pressed = False
+
+        if self._is_ctrl_key(event):
+            if event.keystate == KeyEvent.key_down:
+                self._ctrl_pressed = True
+            elif event.keystate == KeyEvent.key_up:
+                self._ctrl_pressed = False
+
+        # Only count combo when both keys are pressed down simultaneously
+        if not (self._shift_pressed and self._ctrl_pressed):
+            return
+
+        # Only detect when one of the keys goes down (to avoid double counting)
+        if event.keystate != KeyEvent.key_down:
+            return
+
+        # Use lock to prevent race conditions when multiple combo taps arrive rapidly
+        async with self._shift_ctrl_tap_lock:
+            current_time = time.time()
+            tap_window = 3.0  # seconds
+            required_taps = 5
+
+            # Check if this is a new tap (prevent counting same combo multiple times)
+            if self._shift_ctrl_tap_times and (current_time - self._shift_ctrl_tap_times[-1]) < 0.1:
+                # Too soon after last tap, probably same combo press
+                return
+
+            # Add current tap time
+            self._shift_ctrl_tap_times.append(current_time)
+
+            # Remove taps older than the window
+            self._shift_ctrl_tap_times = [
+                t for t in self._shift_ctrl_tap_times if current_time - t <= tap_window
+            ]
+
+            tap_count = len(self._shift_ctrl_tap_times)
+            _logger.debug(
+                f"Shift+Ctrl combo tap detected! Count: {tap_count}/{required_taps} in last {tap_window}s"
+            )
+
+            # Check if we have enough taps
+            if tap_count >= required_taps:
+                _logger.warning(
+                    f"📖 Shift+Ctrl combo sequence detected! {tap_count} taps in {tap_window} seconds"
+                )
+                await self._toggle_poem_output()
+
+    async def _toggle_poem_output(self) -> None:
+        """Toggle the poem output on/off"""
+        # Clear tap times at the start to prevent them from interfering with next detection
+        self._shift_ctrl_tap_times.clear()
+
+        if self._poem_output_active:
+            # Stop the poem output
+            _logger.warning("🔴 Shift+Ctrl combo detected - STOPPING poem output")
+            self._poem_output_active = False
+            if self._poem_output_task and not self._poem_output_task.done():
+                self._poem_output_task.cancel()
+                try:
+                    await self._poem_output_task
+                except CancelledError:
+                    pass
+            self._poem_output_task = None
+            _logger.warning("📖 Poem output stopped")
+        else:
+            # Start the poem output
+            _logger.warning("🟢 Shift+Ctrl combo detected - STARTING poem output")
+
+            # Release all keyboard keys to prevent stuck keys (especially Shift/Ctrl)
+            keyboard = self._gadget_manager.get_keyboard()
+            if keyboard is not None:
+                try:
+                    keyboard.release_all()
+                    _logger.debug(
+                        "Released all keyboard keys before starting poem output"
+                    )
+                except Exception as e:
+                    _logger.warning(f"Failed to release keyboard keys: {e}")
+
+            self._poem_output_active = True
+            self._poem_output_task = asyncio.create_task(self._poem_output_loop())
+            _logger.warning("📖 Poem output started")
+
+    async def _poem_output_loop(self) -> None:
+        """Continuously output poem text, looping when it ends"""
+        try:
+            # Get the directory where mouse_patterns.json is located
+            config_dir = Path(__file__).parent
+            poem_file = config_dir / "poem.txt"
+
+            _logger.warning(f"📖 Reading poem from: {poem_file}")
+
+            # Check if poem file exists
+            if not poem_file.exists():
+                _logger.error(f"❌ Poem file not found: {poem_file}")
+                self._poem_output_active = False
+                return
+
+            # Read the poem content
+            with open(poem_file, "r", encoding="utf-8") as f:
+                poem_content = f.read()
+
+            if not poem_content.strip():
+                _logger.warning("⚠️  Poem file is empty")
+                self._poem_output_active = False
+                return
+
+            _logger.warning(f"📝 Outputting poem ({len(poem_content)} characters) in loop mode...")
+
+            # Get keyboard layout for proper character typing
+            keyboard_layout = self._gadget_manager.get_keyboard_layout()
+            if keyboard_layout is None:
+                _logger.error("❌ Keyboard layout not available")
+                self._poem_output_active = False
+                return
+
+            # Get keyboard device for key release
+            keyboard = self._gadget_manager.get_keyboard()
+            if keyboard is None:
+                _logger.error("❌ Keyboard device not available")
+                self._poem_output_active = False
+                return
+
+            # Release all keys before starting
+            keyboard.release_all()
+            await asyncio.sleep(0.1)
+
+            # Loop forever until cancelled
+            while self._poem_output_active:
+                _logger.debug("Starting poem output cycle")
+
+                # Type out the poem character by character
+                for char in poem_content:
+                    # Check if we should stop
+                    if not self._poem_output_active:
+                        _logger.debug("Poem output cancelled during character loop")
+                        break
+
+                    try:
+                        # Use keyboard_layout.write() for proper character interpretation
+                        # This handles ASCII characters, special characters, and shift keys automatically
+                        keyboard_layout.write(char)
+
+                        # Delay between characters - 4Hz typing speed (0.25 seconds per character)
+                        await asyncio.sleep(0.25)
+
+                    except Exception as e:
+                        # Skip characters that can't be typed
+                        _logger.debug(f"Skipping character '{char}' (ord={ord(char)}): {e}")
+                        continue
+
+                # Release all keys at end of cycle
+                keyboard.release_all()
+                _logger.debug("Poem output cycle completed, restarting from beginning...")
+
+                # Small delay before restarting
+                await asyncio.sleep(0.1)
+
+        except CancelledError:
+            _logger.debug("Poem output loop cancelled")
+            raise
+        except Exception as e:
+            _logger.error(f"❌ Error outputting poem: {e}", exc_info=True)
+        finally:
+            # Release all keys when done
+            keyboard = self._gadget_manager.get_keyboard()
+            if keyboard is not None:
+                try:
+                    keyboard.release_all()
+                except Exception:
+                    pass
+            _logger.warning("📖 Poem output loop ended")
 
     def _calculate_circle_delta(
         self, step: int, prev_x: float, prev_y: float, config: dict[str, Any], radius: Optional[float] = None, steps: Optional[int] = None
